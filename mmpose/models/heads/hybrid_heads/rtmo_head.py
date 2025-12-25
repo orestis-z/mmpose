@@ -308,26 +308,39 @@ class DCC(BaseModule):
                              torch.linspace(-0.5, 0.5, self.num_bins[0]))
 
     def _apply_softmax(self, x_hms, y_hms):
-        """Apply softmax on 1-D heatmaps.
+        """Apply softmax on 1-D heatmaps using native torch functions."""
 
-        Args:
-            x_hms (Tensor): 1-D heatmap in x direction.
-            y_hms (Tensor): 1-D heatmap in y direction.
-
-        Returns:
-            tuple: A tuple containing the normalized x and y heatmaps.
-        """
-
-        x_hms = x_hms.clamp(min=-5e4, max=5e4)
-        y_hms = y_hms.clamp(min=-5e4, max=5e4)
-        pred_x = x_hms - x_hms.max(dim=-1, keepdims=True).values.detach()
-        pred_y = y_hms - y_hms.max(dim=-1, keepdims=True).values.detach()
-
-        exp_x, exp_y = pred_x.exp(), pred_y.exp()
-        prob_x = exp_x / (exp_x.sum(dim=-1, keepdims=True) + EPS)
-        prob_y = exp_y / (exp_y.sum(dim=-1, keepdims=True) + EPS)
+        # Remove the manual clamping and detachment logic that creates 
+        # a complex web of individual ONNX operators.
+        
+        # Using the native functional call allows ONNX to export a single 'Softmax' 
+        # node, which has highly optimized kernels in TensorRT.
+        prob_x = torch.nn.functional.softmax(x_hms, dim=-1)
+        prob_y = torch.nn.functional.softmax(y_hms, dim=-1)
 
         return prob_x, prob_y
+
+    # def _apply_softmax(self, x_hms, y_hms):
+    #     """Apply softmax on 1-D heatmaps.
+
+    #     Args:
+    #         x_hms (Tensor): 1-D heatmap in x direction.
+    #         y_hms (Tensor): 1-D heatmap in y direction.
+
+    #     Returns:
+    #         tuple: A tuple containing the normalized x and y heatmaps.
+    #     """
+
+    #     x_hms = x_hms.clamp(min=-5e4, max=5e4)
+    #     y_hms = y_hms.clamp(min=-5e4, max=5e4)
+    #     pred_x = x_hms - x_hms.max(dim=-1, keepdims=True).values.detach()
+    #     pred_y = y_hms - y_hms.max(dim=-1, keepdims=True).values.detach()
+
+    #     exp_x, exp_y = pred_x.exp(), pred_y.exp()
+    #     prob_x = exp_x / (exp_x.sum(dim=-1, keepdims=True) + EPS)
+    #     prob_y = exp_y / (exp_y.sum(dim=-1, keepdims=True) + EPS)
+
+    #     return prob_x, prob_y
 
     def _get_bin_enc(self, bbox_cs, grids):
         """Calculate dynamic bin encodings for expanded bounding box.
@@ -572,27 +585,69 @@ class DCC(BaseModule):
         beta_q = beta_q.detach().cpu()
         beta_k = beta_k.detach().cpu()
 
+       # Access the normalization layer and parameters via self.gau
+        # since they are attributes of the GAUEncoder, not the DCC directly
+        ln_module = self.gau.ln
+        static_feat_dim = self.gau.uv.in_features 
+        
+        # Pre-expand the scalar weight [1] to [128]
+        # Access the weight 'g' from the gau's ln module
+        expanded_weight = ln_module.g.expand(static_feat_dim).clone().detach()
+
         @torch.no_grad()
         def _forward(self, x, *args, **kwargs):
-            norm = torch.linalg.norm(x, dim=-1, keepdim=True) * self.ln.scale
-            x = x / norm.clamp(min=self.ln.eps) * self.ln.g
+            # 3. Pass the expanded weight DIRECTLY into the functional call.
+            # This prevents the exporter from getting confused by separate 
+            # multiplication and ensures the ONNX node has the correct scale size.
+            x = torch.nn.functional.layer_norm(
+                x, 
+                (static_feat_dim,), 
+                weight=expanded_weight.to(x.device), 
+                bias=None, 
+                eps=self.ln.eps
+            )
 
             uv = self.uv(x)
             uv = self.act_fn(uv)
 
             u, v, base = torch.split(uv, [self.e, self.e, self.s], dim=-1)
+            
             if not torch.onnx.is_in_onnx_export():
                 q = base * gamma_q.to(base) + beta_q.to(base)
                 k = base * gamma_k.to(base) + beta_k.to(base)
             else:
                 q = base * gamma_q + beta_q
                 k = base * gamma_k + beta_k
+                
             qk = torch.matmul(q, k.transpose(-1, -2))
-
             kernel = torch.square(torch.nn.functional.relu(qk / self.sqrt_s))
             x = u * torch.matmul(kernel, v)
             x = self.o(x)
             return x
+
+        # @torch.no_grad()
+        # def _forward(self, x, *args, **kwargs):
+        #     norm = torch.linalg.norm(x, dim=-1, keepdim=True) * self.ln.scale
+        #     # Ensure eps has same dtype as norm for ONNX export compatibility
+        #     eps = torch.tensor(self.ln.eps, dtype=norm.dtype, device=norm.device)
+        #     x = x / norm.clamp(min=eps) * self.ln.g
+
+        #     uv = self.uv(x)
+        #     uv = self.act_fn(uv)
+
+        #     u, v, base = torch.split(uv, [self.e, self.e, self.s], dim=-1)
+        #     if not torch.onnx.is_in_onnx_export():
+        #         q = base * gamma_q.to(base) + beta_q.to(base)
+        #         k = base * gamma_k.to(base) + beta_k.to(base)
+        #     else:
+        #         q = base * gamma_q + beta_q
+        #         k = base * gamma_k + beta_k
+        #     qk = torch.matmul(q, k.transpose(-1, -2))
+
+        #     kernel = torch.square(torch.nn.functional.relu(qk / self.sqrt_s))
+        #     x = u * torch.matmul(kernel, v)
+        #     x = self.o(x)
+        #     return x
 
         self.gau._forward = types.MethodType(_forward, self.gau)
 

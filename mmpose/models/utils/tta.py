@@ -87,6 +87,23 @@ def flip_vectors(x_labels: Tensor, y_labels: Tensor, flip_indices: List[int]):
 
     return x_labels, y_labels
 
+def flip_vector(labels: Tensor, flip_indices: List[int]):
+    """Flip instance-level labels in specific axis for test-time augmentation.
+
+    Args:
+        x_labels (Tensor): The vector labels in x-axis to flip. Should be
+            a tensor in shape [B, C, Wx]
+        y_labels (Tensor): The vector labels in y-axis to flip. Should be
+            a tensor in shape [B, C, Wy]
+        flip_indices (List[int]): The indices of each keypoint's symmetric
+            keypoint
+    """
+    assert labels.ndim == 3
+    assert len(flip_indices) == labels.shape[1]
+    labels = labels[:, flip_indices]
+
+    return labels
+
 
 def flip_coordinates(coords: Tensor, flip_indices: List[int],
                      shift_coords: bool, input_size: Tuple[int, int]):

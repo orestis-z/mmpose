@@ -1,3 +1,5 @@
+import os
+
 _base_ = ['../../../_base_/default_runtime.py']
 
 # runtime
@@ -119,8 +121,8 @@ dataset_coco = dict(
 )
 
 train_dataloader = dict(
-    batch_size=32,
-    num_workers=8,
+    batch_size=23,
+    num_workers=os.cpu_count(),
     persistent_workers=True,
     pin_memory=True,
     sampler=dict(type='DefaultSampler', shuffle=True),
@@ -318,6 +320,6 @@ model = dict(
     ),
     test_cfg=dict(
         input_size=input_size,
-        score_thr=0.1,
+        score_thr=0.5,
         nms_thr=0.65,
     ))
